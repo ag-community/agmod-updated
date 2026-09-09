@@ -1,0 +1,126 @@
+name: Build
+
+# Controls when the action will run. Triggers the workflow on push, pull request or manual events
+on: 
+  push:
+  pull_request:
+  workflow_dispatch:
+
+  # Run GitHub Actions monthly to make sure CI isn't broken
+  schedule:
+    - cron: '0 0 1 * *'
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  build:
+    name: "Build on ${{ matrix.os.suffix }}"
+
+    strategy:
+      matrix:
+        os:
+          - runs-on: windows-2022
+            vcpkg-triplet: x86-windows-static
+            suffix: ci-windows
+          - runs-on: ubuntu-22.04
+            vcpkg-triplet: x86-linux
+            suffix: ci-linux
+        target: [server]
+
+    # The type of runner that the job will run on
+    runs-on: ${{ matrix.os.runs-on }}
+
+    env:
+      VCPKG_ROOT: '${{github.workspace}}/vcpkg'
+      VCPKG_DEFAULT_TRIPLET: '${{ matrix.os.vcpkg-triplet }}'
+      VCPKG_DEFAULT_HOST_TRIPLET: '${{ matrix.os.vcpkg-triplet }}'
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0 # Required for automatic versioning
+      
+      - name: Install Ubuntu packages
+        if: matrix.os.runs-on == 'ubuntu-22.04'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt update || true
+          sudo apt install -y libc6:i386 linux-libc-dev:i386 ninja-build gcc-multilib g++-multilib
+
+      # Restore artifacts, or setup vcpkg for building artifacts
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        id: runvcpkg
+        with:
+          vcpkgJsonGlob: 'vcpkg.json'
+          vcpkgDirectory: '${{env.VCPKG_ROOT}}'
+          vcpkgGitCommitId: 'ef7dbf94b9198bc58f45951adcf1f041fcbc5ea0'
+          runVcpkgInstall: false
+      
+      - name: Set up rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.0
+
+      # Run CMake+vcpkg+Ninja+CTest to generate/build/test.
+      - name: Build and Test with CMake
+        uses: lukka/run-cmake@v10
+        id: runcmake
+        with:
+          configurePreset: github-actions
+          buildPreset: github-actions
+          buildPresetAdditionalArgs: "['--target', 'ci-${{ matrix.target }}']"
+          testPreset: github-actions
+          testPresetAdditionalArgs: "['-R', '${{ matrix.target }}']"
+        env:
+          VCPKG_FORCE_SYSTEM_BINARIES: 1
+
+      # Install
+      - name: Install with CMake
+        run: |
+          cmake --install ${{github.workspace}}/_build/github-actions --config RelWithDebInfo --prefix ${{github.workspace}}/_build/ci-install --component ${{ matrix.target }}
+
+      # Prepare and Upload Artifact
+      - name: Prepare and Upload Artifact
+        id: prepare_artifact
+        run: >
+          python scripts/package_target.py
+          --build-dir ${{github.workspace}}/_build/github-actions
+          --install-dir ${{github.workspace}}/_build/ci-install
+          --artifact-dir ${{github.workspace}}/_build/ci-artifact
+          --target ${{ matrix.target }}
+          --suffix ${{ matrix.os.suffix }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare_artifact.outputs.artifact_name }}
+          path: ${{github.workspace}}/_build/ci-artifact/${{ steps.prepare_artifact.outputs.artifact_name }}
+
+  package:
+    name: "Package Release"
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Copy hamdata.ini to Windows artifact
+        run: |
+          mkdir -p artifacts/AG-server-ci-windows/ag_addon/addons/amxmodx/configs
+          cp artifacts/AG-server-ci-linux/ag_addon/addons/amxmodx/configs/hamdata.ini artifacts/AG-server-ci-windows/ag_addon/addons/amxmodx/configs/hamdata.ini
+
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AG-server-ci-windows
+          path: artifacts/AG-server-ci-windows
+          overwrite: true
+
+      - name: Upload Linux Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AG-server-ci-linux
+          path: artifacts/AG-server-ci-linux
+          overwrite: true
